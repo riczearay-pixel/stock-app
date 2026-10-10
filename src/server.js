@@ -23,7 +23,7 @@ async function cached(key, ttlMs, fn) {
 
 const getQuote = (key) =>
   cached(`q:${key}`, 15e3, () => (DEMO ? demoQuote(key, ASSETS[key].name, ASSETS[key].unit) : fetchQuote(key)));
-const getHistory = (key) => cached(`h:${key}`, 3600e3, () => (DEMO ? demoHistory(key) : fetchHistory(key, '10y')));
+const getHistory = (key) => cached(`h:${key}`, 3600e3, () => (DEMO ? demoHistory(key) : fetchHistory(key)));
 
 async function getForecast(key) {
   const quote = await getQuote(key);

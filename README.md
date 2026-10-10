@@ -13,6 +13,8 @@
 
 需要 Node.js 18 及以上，无需 `npm install`。
 
+> Windows PowerShell 如果提示"禁止运行脚本"，把 `npm` 换成 `npm.cmd`，或直接运行 `node src/server.js`。
+
 ```bash
 npm start          # 真实行情，打开 http://localhost:3000
 npm run demo       # 离线演示模式（随机生成数据，无需网络）
@@ -23,11 +25,16 @@ npm test           # 运行模型单元测试
 
 ## 数据来源
 
-- 首选 Yahoo Finance 图表接口（分时 + 10 年日线）
-- Yahoo 不可用时自动回退到 Stooq 日线数据
+依次尝试以下数据源，自动使用第一个可用的，并记住上次成功的数据源：
+
+1. Yahoo Finance（海外网络，含分时）
+2. 东方财富（中国大陆网络可直接访问，含分时）
+3. Stooq（仅日线）
+
+如果页面显示"行情获取失败"，运行 `node src/check.js` 可以逐个测试每个数据源是否能连通。
 - 服务端做了缓存：报价 15 秒，历史数据 1 小时，预测 1 分钟
 
-> Yahoo / Stooq 的免费数据可能有约 15 分钟延迟，且接口并非官方承诺长期可用。
+> 免费数据可能有约 15 分钟延迟，且接口并非官方承诺长期可用。
 
 ## 预测方法
 
@@ -48,7 +55,8 @@ npm test           # 运行模型单元测试
 
 ```
 src/server.js   HTTP 服务与 API（/api/quote/:key, /api/history/:key, /api/forecast/:key）
-src/data.js     行情抓取（Yahoo，失败回退 Stooq）
+src/data.js     行情抓取（Yahoo → 东方财富 → Stooq 依次回退）
+src/check.js    数据源连通性诊断
 src/model.js    蒙特卡洛预测模型
 src/demo.js     离线演示数据
 public/         前端页面（Chart.js）

@@ -1,33 +1,50 @@
 'use strict';
 
-// 行情数据：优先 Yahoo Finance，失败时回退到 Stooq（仅日线）
+// 行情数据：依次尝试多个数据源，哪个可用就用哪个，并记住上次成功的源优先使用
+//   1. Yahoo Finance（海外网络通常可用，有分时）
+//   2. 东方财富（中国大陆网络可直接访问，有分时）
+//   3. Stooq（仅日线，部分地区可能拒绝访问）
 
 const ASSETS = {
-  sp500: { name: '标普500指数', yahoo: '^GSPC', stooq: '^spx', currency: 'USD', unit: '点' },
-  gold: { name: '黄金 (COMEX 期货)', yahoo: 'GC=F', stooq: 'xauusd', currency: 'USD', unit: '美元/盎司' },
+  sp500: { name: '标普500指数', yahoo: '^GSPC', eastmoney: '100.SPX', stooq: '^spx', currency: 'USD', unit: '点' },
+  gold: { name: '黄金 (COMEX 期货)', yahoo: 'GC=F', eastmoney: '101.GC00Y', stooq: 'xauusd', currency: 'USD', unit: '美元/盎司' },
 };
 
-const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-async function getJson(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(10000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${new URL(url).host}`);
-  return res.json();
+async function request(url, headers = {}) {
+  const res = await fetch(url, { headers: { 'User-Agent': UA, ...headers }, signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res;
+}
+const getJson = async (url, headers) => (await request(url, headers)).json();
+const getText = async (url, headers) => (await request(url, headers)).text();
+
+function quoteFrom(asset, key, { price, previousClose, marketTime, intraday }, source) {
+  if (!Number.isFinite(price) || !Number.isFinite(previousClose)) throw new Error('报价数据不完整');
+  return {
+    key,
+    name: asset.name,
+    unit: asset.unit,
+    currency: asset.currency,
+    price,
+    previousClose,
+    change: price - previousClose,
+    changePct: (price - previousClose) / previousClose,
+    marketTime,
+    intraday,
+    source,
+  };
 }
 
-async function getText(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${new URL(url).host}`);
-  return res.text();
-}
-
+// ---------- Yahoo Finance ----------
 function yahooUrl(symbol, range, interval) {
   return `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}&includePrePost=false`;
 }
 
 function parseYahoo(json) {
   const r = json?.chart?.result?.[0];
-  if (!r) throw new Error(json?.chart?.error?.description || 'Yahoo 返回数据为空');
+  if (!r) throw new Error(json?.chart?.error?.description || '返回数据为空');
   const ts = r.timestamp || [];
   const close = r.indicators?.quote?.[0]?.close || [];
   const points = [];
@@ -37,9 +54,95 @@ function parseYahoo(json) {
   return { meta: r.meta, points };
 }
 
+const yahoo = {
+  name: 'Yahoo Finance',
+  async quote(a) {
+    const { meta, points } = parseYahoo(await getJson(yahooUrl(a.yahoo, '1d', '2m')));
+    return {
+      price: meta.regularMarketPrice ?? points.at(-1)?.c,
+      previousClose: meta.chartPreviousClose ?? meta.previousClose,
+      marketTime: (meta.regularMarketTime || 0) * 1000 || points.at(-1)?.t,
+      intraday: points,
+    };
+  },
+  async history(a) {
+    return parseYahoo(await getJson(yahooUrl(a.yahoo, '10y', '1d'))).points;
+  },
+};
+
+// ---------- 东方财富 ----------
+const EM_HEADERS = { Referer: 'https://quote.eastmoney.com/' };
+
+// 东方财富时间为北京时间
+function parseBeijingTime(s) {
+  const iso = s.length <= 10 ? `${s}T15:00:00+08:00` : `${s.replace(' ', 'T')}:00+08:00`;
+  return Date.parse(iso);
+}
+
+// kline 行格式："日期,开盘,收盘,最高,最低,..."
+function parseEastmoneyKlines(json) {
+  const lines = json?.data?.klines;
+  if (!Array.isArray(lines) || lines.length === 0) throw new Error('返回数据为空');
+  const points = [];
+  for (const line of lines) {
+    const [date, , close] = line.split(',');
+    const c = Number(close);
+    const t = parseBeijingTime(date);
+    if (Number.isFinite(c) && c > 0 && Number.isFinite(t)) points.push({ t, c });
+  }
+  return points;
+}
+
+// trends 行格式："时间,开盘,收盘,最高,最低,..."
+function parseEastmoneyTrends(json) {
+  const d = json?.data;
+  if (!d || !Array.isArray(d.trends)) throw new Error('返回数据为空');
+  const points = [];
+  for (const line of d.trends) {
+    const [time, , close] = line.split(',');
+    const c = Number(close);
+    const t = parseBeijingTime(time);
+    if (Number.isFinite(c) && c > 0 && Number.isFinite(t)) points.push({ t, c });
+  }
+  const preClose = Number(d.preClose ?? d.prePrice);
+  return { points, preClose: Number.isFinite(preClose) && preClose > 0 ? preClose : undefined };
+}
+
+function eastmoneyKlineUrl(secid, limit) {
+  return `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&klt=101&fqt=0&lmt=${limit}&end=20500101` +
+    '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57';
+}
+
+const eastmoney = {
+  name: '东方财富',
+  async quote(a) {
+    const klines = parseEastmoneyKlines(await getJson(eastmoneyKlineUrl(a.eastmoney, 5), EM_HEADERS));
+    let intraday = [];
+    let preClose;
+    try {
+      const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${a.eastmoney}&ndays=1&iscr=0` +
+        '&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58';
+      ({ points: intraday, preClose } = parseEastmoneyTrends(await getJson(url, EM_HEADERS)));
+    } catch {
+      // 分时数据只用于小图，失败不影响报价
+    }
+    const last = intraday.at(-1) || klines.at(-1);
+    return {
+      price: last.c,
+      previousClose: preClose ?? klines.at(-2)?.c,
+      marketTime: last.t,
+      intraday,
+    };
+  },
+  async history(a) {
+    return parseEastmoneyKlines(await getJson(eastmoneyKlineUrl(a.eastmoney, 2600), EM_HEADERS));
+  },
+};
+
+// ---------- Stooq ----------
 function parseStooqCsv(csv) {
   const lines = csv.trim().split(/\r?\n/);
-  if (!/^Date,/i.test(lines[0] || '')) throw new Error('Stooq 返回格式异常');
+  if (!/^Date,/i.test(lines[0] || '')) throw new Error('返回格式异常');
   const points = [];
   for (const line of lines.slice(1)) {
     const [date, , , , close] = line.split(',');
@@ -47,67 +150,59 @@ function parseStooqCsv(csv) {
     const t = Date.parse(date + 'T21:00:00Z');
     if (Number.isFinite(c) && Number.isFinite(t)) points.push({ t, c });
   }
-  if (points.length === 0) throw new Error('Stooq 无数据');
+  if (points.length === 0) throw new Error('无数据');
   return points;
 }
 
-// 实时报价（含当日分时）
+const stooq = {
+  name: 'Stooq',
+  async history(a) {
+    const points = parseStooqCsv(await getText(`https://stooq.com/q/d/l/?s=${encodeURIComponent(a.stooq)}&i=d`));
+    const cutoff = Date.now() - 10 * 365.25 * 86400e3;
+    return points.filter((p) => p.t >= cutoff);
+  },
+  async quote(a) {
+    const points = await this.history(a);
+    return { price: points.at(-1).c, previousClose: points.at(-2)?.c, marketTime: points.at(-1).t, intraday: [] };
+  },
+};
+
+// ---------- 依次尝试 ----------
+const SOURCES = [yahoo, eastmoney, stooq];
+const preferred = { quote: null, history: null };
+
+async function tryAll(kind, fn) {
+  const order = preferred[kind] ? [preferred[kind], ...SOURCES.filter((s) => s !== preferred[kind])] : SOURCES;
+  const errors = [];
+  for (const src of order) {
+    try {
+      const value = await fn(src);
+      preferred[kind] = src;
+      return { value, source: src.name };
+    } catch (err) {
+      errors.push(`${src.name}: ${err.cause?.code || err.message}`);
+    }
+  }
+  throw new Error(`所有数据源都不可用（${errors.join('；')}）`);
+}
+
 async function fetchQuote(key) {
   const a = ASSETS[key];
-  try {
-    const { meta, points } = parseYahoo(await getJson(yahooUrl(a.yahoo, '1d', '2m')));
-    const price = meta.regularMarketPrice ?? points.at(-1)?.c;
-    const prev = meta.chartPreviousClose ?? meta.previousClose;
-    return {
-      key,
-      name: a.name,
-      unit: a.unit,
-      currency: meta.currency || a.currency,
-      price,
-      previousClose: prev,
-      change: price - prev,
-      changePct: (price - prev) / prev,
-      marketTime: (meta.regularMarketTime || 0) * 1000 || points.at(-1)?.t,
-      intraday: points,
-      source: 'Yahoo Finance',
-    };
-  } catch (err) {
-    const points = await fetchStooqDaily(a.stooq);
-    const last = points.at(-1);
-    const prev = points.at(-2);
-    return {
-      key,
-      name: a.name,
-      unit: a.unit,
-      currency: a.currency,
-      price: last.c,
-      previousClose: prev.c,
-      change: last.c - prev.c,
-      changePct: (last.c - prev.c) / prev.c,
-      marketTime: last.t,
-      intraday: [],
-      source: `Stooq（Yahoo 不可用：${err.message}）`,
-    };
-  }
+  const { value, source } = await tryAll('quote', async (src) => quoteFrom(a, key, await src.quote(a), src.name));
+  return { ...value, source };
 }
 
-async function fetchStooqDaily(symbol) {
-  return parseStooqCsv(await getText(`https://stooq.com/q/d/l/?s=${encodeURIComponent(symbol)}&i=d`));
-}
-
-// 日线历史
-async function fetchHistory(key, range = '10y') {
+async function fetchHistory(key) {
   const a = ASSETS[key];
-  try {
-    const { points } = parseYahoo(await getJson(yahooUrl(a.yahoo, range, '1d')));
-    if (points.length < 250) throw new Error('Yahoo 历史数据过少');
-    return { points, source: 'Yahoo Finance' };
-  } catch (err) {
-    const years = parseInt(range, 10) || 10;
-    const cutoff = Date.now() - years * 365.25 * 86400e3;
-    const points = (await fetchStooqDaily(a.stooq)).filter((p) => p.t >= cutoff);
-    return { points, source: `Stooq（Yahoo 不可用：${err.message}）` };
-  }
+  const { value, source } = await tryAll('history', async (src) => {
+    const points = await src.history(a);
+    if (points.length < 250) throw new Error(`历史数据过少（${points.length} 条）`);
+    return points;
+  });
+  return { points: value, source };
 }
 
-module.exports = { ASSETS, fetchQuote, fetchHistory, parseYahoo, parseStooqCsv };
+module.exports = {
+  ASSETS, SOURCES, fetchQuote, fetchHistory,
+  parseYahoo, parseStooqCsv, parseEastmoneyKlines, parseEastmoneyTrends,
+};

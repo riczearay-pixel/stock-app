@@ -73,3 +73,16 @@ test('解析 Stooq CSV', () => {
   assert.strictEqual(pts[1].c, 1.7);
   assert.throws(() => parseStooqCsv('No data'), /格式异常/);
 });
+
+test('解析东方财富日线与分时', () => {
+  const { parseEastmoneyKlines, parseEastmoneyTrends } = require('../src/data');
+  const pts = parseEastmoneyKlines({ data: { klines: ['2024-01-02,4745.20,4742.83,4754.33,4722.67,0,0', '2024-01-03,4725.07,4704.81,4729.29,4699.71,0,0'] } });
+  assert.strictEqual(pts.length, 2);
+  assert.strictEqual(pts[1].c, 4704.81);
+  assert.strictEqual(new Date(pts[0].t).toISOString(), '2024-01-02T07:00:00.000Z');
+  assert.throws(() => parseEastmoneyKlines({ data: null }), /为空/);
+  const tr = parseEastmoneyTrends({ data: { preClose: 4742.83, trends: ['2024-01-03 22:31,4725.0,4726.5,4727,4724,0,0,4726'] } });
+  assert.strictEqual(tr.preClose, 4742.83);
+  assert.strictEqual(tr.points[0].c, 4726.5);
+  assert.strictEqual(new Date(tr.points[0].t).toISOString(), '2024-01-03T14:31:00.000Z');
+});
