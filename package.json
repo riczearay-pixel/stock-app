@@ -1,0 +1,13 @@
+{
+  "name": "stock-app",
+  "version": "1.0.0",
+  "description": "标普500指数与黄金实时行情，以及未来6个月价格走向与概率预测",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "demo": "DEMO=1 node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
