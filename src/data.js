@@ -1,24 +1,67 @@
 'use strict';
 
 // 行情数据：依次尝试多个数据源，哪个可用就用哪个，并记住上次成功的源优先使用
-//   1. Yahoo Finance（海外网络通常可用，有分时）
-//   2. 东方财富（中国大陆网络可直接访问，有分时）
-//   3. Stooq（仅日线，部分地区可能拒绝访问）
+//   1. Yahoo Finance（海外网络通常可用，有分时；中国大陆会返回 403）
+//   2. 新浪财经（中国大陆网络可直接访问，无分时）
+//   3. 东方财富（中国大陆网络可直接访问，有分时）
+//   4. Stooq（仅日线，部分地区可能拒绝访问）
+
+const https = require('https');
+const http = require('http');
 
 const ASSETS = {
-  sp500: { name: '标普500指数', yahoo: '^GSPC', eastmoney: '100.SPX', stooq: '^spx', currency: 'USD', unit: '点' },
-  gold: { name: '黄金 (COMEX 期货)', yahoo: 'GC=F', eastmoney: '101.GC00Y', stooq: 'xauusd', currency: 'USD', unit: '美元/盎司' },
+  sp500: {
+    name: '标普500指数', currency: 'USD', unit: '点',
+    yahoo: '^GSPC', eastmoney: '100.SPX', stooq: '^spx',
+    sina: { quote: 'gb_$inx', history: 'https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var%20_INX=/US_MinKService.getDailyK?symbol=.INX' },
+  },
+  gold: {
+    name: '黄金 (COMEX 期货)', currency: 'USD', unit: '美元/盎司',
+    yahoo: 'GC=F', eastmoney: '101.GC00Y', stooq: 'xauusd',
+    sina: { quote: 'hf_GC', history: 'https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_GC=/GlobalFuturesService.getGlobalFuturesDailyKLine?symbol=GC&source=web' },
+  },
 };
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-async function request(url, headers = {}) {
-  const res = await fetch(url, { headers: { 'User-Agent': UA, ...headers }, signal: AbortSignal.timeout(8000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res;
+// 用 Node 自带的 http/https 模块发请求（请求头更接近浏览器，部分国内接口会拒绝 fetch 的默认请求头）
+function nodeGet(url, headers) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https:') ? https : http;
+    const req = lib.get(url, { headers, timeout: 8000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return resolve(nodeGet(new URL(res.headers.location, url).toString(), headers));
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(Object.assign(new Error('请求超时'), { code: 'ETIMEDOUT' })));
+    req.on('error', reject);
+  });
 }
-const getJson = async (url, headers) => (await request(url, headers)).json();
-const getText = async (url, headers) => (await request(url, headers)).text();
+
+let transport = nodeGet;
+// 仅供测试替换网络层
+function setTransport(fn) {
+  transport = fn || nodeGet;
+}
+
+async function getText(url, headers = {}) {
+  const res = await transport(url, { 'User-Agent': UA, Accept: '*/*', Connection: 'close', ...headers });
+  if (res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res.status}`);
+  return res.text;
+}
+async function getJson(url, headers) {
+  const text = await getText(url, headers);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('返回内容不是 JSON');
+  }
+}
 
 function quoteFrom(asset, key, { price, previousClose, marketTime, intraday }, source) {
   if (!Number.isFinite(price) || !Number.isFinite(previousClose)) throw new Error('报价数据不完整');
@@ -70,6 +113,58 @@ const yahoo = {
   },
 };
 
+// ---------- 新浪财经 ----------
+const SINA_HEADERS = { Referer: 'https://finance.sina.com.cn/' };
+
+// 实时报价：var hq_str_xxx="字段1,字段2,...";
+function parseSinaQuote(text, code) {
+  const m = text.match(/="([^"]*)"/);
+  if (!m || !m[1]) throw new Error('返回数据为空');
+  const f = m[1].split(',');
+  if (code.startsWith('gb_')) {
+    // 美股/指数：[1]现价 [3]时间(北京) [4]涨跌额
+    const price = Number(f[1]);
+    return { price, previousClose: price - Number(f[4]), marketTime: parseBeijingTime(f[3].slice(0, 16)) };
+  }
+  // 外盘期货 hf_：[0]现价 [7]昨结算 [6]时间 [12]日期
+  const t = parseBeijingTime(`${f[12]} ${String(f[6]).slice(0, 5)}`);
+  return { price: Number(f[0]), previousClose: Number(f[7]), marketTime: Number.isFinite(t) ? t : Date.now() };
+}
+
+// 日线：var _X=([{"date"|"d":..., "close"|"c":...}, ...]);
+function parseSinaKline(text) {
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start < 0 || end < start) throw new Error('返回数据为空');
+  let rows;
+  try {
+    rows = JSON.parse(text.slice(start, end + 1));
+  } catch {
+    throw new Error('返回格式异常');
+  }
+  const points = [];
+  for (const r of rows) {
+    const c = Number(r.close ?? r.c);
+    const t = parseBeijingTime(String(r.date ?? r.d).slice(0, 10));
+    if (Number.isFinite(c) && c > 0 && Number.isFinite(t)) points.push({ t, c });
+  }
+  if (points.length === 0) throw new Error('无数据');
+  return points;
+}
+
+const sina = {
+  name: '新浪财经',
+  async quote(a) {
+    const text = await getText(`https://hq.sinajs.cn/list=${a.sina.quote}`, SINA_HEADERS);
+    return { ...parseSinaQuote(text, a.sina.quote), intraday: [] };
+  },
+  async history(a) {
+    const points = parseSinaKline(await getText(a.sina.history, SINA_HEADERS));
+    const cutoff = Date.now() - 10 * 365.25 * 86400e3;
+    return points.filter((p) => p.t >= cutoff);
+  },
+};
+
 // ---------- 东方财富 ----------
 const EM_HEADERS = { Referer: 'https://quote.eastmoney.com/' };
 
@@ -110,19 +205,30 @@ function parseEastmoneyTrends(json) {
 
 function eastmoneyKlineUrl(secid, limit) {
   return `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&klt=101&fqt=0&lmt=${limit}&end=20500101` +
-    '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57';
+    '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&ut=fa5fd1943c7b386f172d6893dbfba10b';
+}
+
+// HTTPS 被断开时再用 HTTP 试一次
+async function getEastmoney(url) {
+  try {
+    return await getJson(url, EM_HEADERS);
+  } catch (err) {
+    return getJson(url.replace('https://', 'http://'), EM_HEADERS).catch(() => {
+      throw err;
+    });
+  }
 }
 
 const eastmoney = {
   name: '东方财富',
   async quote(a) {
-    const klines = parseEastmoneyKlines(await getJson(eastmoneyKlineUrl(a.eastmoney, 5), EM_HEADERS));
+    const klines = parseEastmoneyKlines(await getEastmoney(eastmoneyKlineUrl(a.eastmoney, 5)));
     let intraday = [];
     let preClose;
     try {
       const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${a.eastmoney}&ndays=1&iscr=0` +
-        '&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58';
-      ({ points: intraday, preClose } = parseEastmoneyTrends(await getJson(url, EM_HEADERS)));
+        '&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ut=fa5fd1943c7b386f172d6893dbfba10b';
+      ({ points: intraday, preClose } = parseEastmoneyTrends(await getEastmoney(url)));
     } catch {
       // 分时数据只用于小图，失败不影响报价
     }
@@ -135,7 +241,7 @@ const eastmoney = {
     };
   },
   async history(a) {
-    return parseEastmoneyKlines(await getJson(eastmoneyKlineUrl(a.eastmoney, 2600), EM_HEADERS));
+    return parseEastmoneyKlines(await getEastmoney(eastmoneyKlineUrl(a.eastmoney, 2600)));
   },
 };
 
@@ -168,7 +274,7 @@ const stooq = {
 };
 
 // ---------- 依次尝试 ----------
-const SOURCES = [yahoo, eastmoney, stooq];
+const SOURCES = [yahoo, sina, eastmoney, stooq];
 const preferred = { quote: null, history: null };
 
 async function tryAll(kind, fn) {
@@ -180,7 +286,7 @@ async function tryAll(kind, fn) {
       preferred[kind] = src;
       return { value, source: src.name };
     } catch (err) {
-      errors.push(`${src.name}: ${err.cause?.code || err.message}`);
+      errors.push(`${src.name}: ${err.code || err.cause?.code || err.message}`);
     }
   }
   throw new Error(`所有数据源都不可用（${errors.join('；')}）`);
@@ -203,6 +309,6 @@ async function fetchHistory(key) {
 }
 
 module.exports = {
-  ASSETS, SOURCES, fetchQuote, fetchHistory,
-  parseYahoo, parseStooqCsv, parseEastmoneyKlines, parseEastmoneyTrends,
+  ASSETS, SOURCES, fetchQuote, fetchHistory, setTransport, nodeGet,
+  parseYahoo, parseStooqCsv, parseEastmoneyKlines, parseEastmoneyTrends, parseSinaQuote, parseSinaKline,
 };

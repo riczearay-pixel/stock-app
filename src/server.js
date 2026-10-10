@@ -21,8 +21,19 @@ async function cached(key, ttlMs, fn) {
   return value;
 }
 
+// 数据源没有分时数据时（如新浪），用每次轮询到的价格拼出当日走势
+const ticks = {};
+function withTicks(q) {
+  if (q.intraday.length > 0) return q;
+  const day = new Date(q.marketTime).toDateString();
+  const buf = (ticks[q.key] = (ticks[q.key] || []).filter((p) => new Date(p.t).toDateString() === day));
+  if (buf.at(-1)?.c !== q.price || buf.length === 0) buf.push({ t: Date.now(), c: q.price });
+  if (buf.length > 1000) buf.shift();
+  return { ...q, intraday: [{ t: buf[0].t - 1, c: q.previousClose }, ...buf] };
+}
+
 const getQuote = (key) =>
-  cached(`q:${key}`, 15e3, () => (DEMO ? demoQuote(key, ASSETS[key].name, ASSETS[key].unit) : fetchQuote(key)));
+  cached(`q:${key}`, 15e3, async () => (DEMO ? demoQuote(key, ASSETS[key].name, ASSETS[key].unit) : withTicks(await fetchQuote(key))));
 const getHistory = (key) => cached(`h:${key}`, 3600e3, () => (DEMO ? demoHistory(key) : fetchHistory(key)));
 
 async function getForecast(key) {

@@ -17,7 +17,7 @@ const { ASSETS, SOURCES } = require('./data');
             : `${r.length} 条日线，最新 ${new Date(r.at(-1).t).toISOString().slice(0, 10)} 收盘 ${r.at(-1).c}`;
           console.log(`  ✅ ${src.name} ${kind === 'quote' ? '报价' : '历史'}：${info}（${Date.now() - started}ms）`);
         } catch (err) {
-          console.log(`  ❌ ${src.name} ${kind === 'quote' ? '报价' : '历史'}：${err.cause?.code || err.message}（${Date.now() - started}ms）`);
+          console.log(`  ❌ ${src.name} ${kind === 'quote' ? '报价' : '历史'}：${err.code || err.cause?.code || err.message}（${Date.now() - started}ms）`);
         }
       }
     }

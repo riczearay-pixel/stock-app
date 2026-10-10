@@ -27,9 +27,10 @@ npm test           # 运行模型单元测试
 
 依次尝试以下数据源，自动使用第一个可用的，并记住上次成功的数据源：
 
-1. Yahoo Finance（海外网络，含分时）
-2. 东方财富（中国大陆网络可直接访问，含分时）
-3. Stooq（仅日线）
+1. Yahoo Finance（海外网络，含分时；中国大陆会返回 403）
+2. 新浪财经（中国大陆网络可直接访问；无分时，由服务端轮询拼出当日走势）
+3. 东方财富（中国大陆网络可直接访问，含分时）
+4. Stooq（仅日线）
 
 如果页面显示"行情获取失败"，运行 `node src/check.js` 可以逐个测试每个数据源是否能连通。
 - 服务端做了缓存：报价 15 秒，历史数据 1 小时，预测 1 分钟
@@ -55,7 +56,7 @@ npm test           # 运行模型单元测试
 
 ```
 src/server.js   HTTP 服务与 API（/api/quote/:key, /api/history/:key, /api/forecast/:key）
-src/data.js     行情抓取（Yahoo → 东方财富 → Stooq 依次回退）
+src/data.js     行情抓取（Yahoo → 新浪 → 东方财富 → Stooq 依次回退）
 src/check.js    数据源连通性诊断
 src/model.js    蒙特卡洛预测模型
 src/demo.js     离线演示数据
